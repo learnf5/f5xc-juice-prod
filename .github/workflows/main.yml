@@ -1,0 +1,118 @@
+name: 'Deploy Juice Shop in AWS'
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_operation:
+        description: "Terraform operation: plan, apply, destroy"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    environment: production
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Install the latest version of Terraform CLI and configure the Terraform CLI configuration file with a Terraform Cloud user API token
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+    - name: Terraform Init
+      run: terraform init
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    - name: Terraform Validate
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      run: |
+         terraform validate
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # Generates an execution plan for Terraform
+    - name: Terraform Plan
+      run: terraform plan -input=false
+      if: "${{ github.event.inputs.terraform_operation == 'plan' }}"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
+    - name: Set up Python
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.x
+      
+    - name: Terraform Apply
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      run: |
+         export myip=$(curl ifconfig.me)/32
+         export TF_VAR_runner_ip=$myip
+         HOSTNAME=`hostname` ssh-keygen -t rsa -C "$HOSTNAME" -f "$HOME/.ssh/id_rsa" -P "" && cat ~/.ssh/id_rsa.pub
+         export public_key=$(cat $HOME/.ssh/id_rsa.pub)
+         export TF_VAR_public_key=$public_key
+         terraform apply -auto-approve -input=false
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
+    - name: Terraform Destroy
+      if: "${{ github.event.inputs.terraform_operation == 'destroy' }}"
+      run: |
+         export TF_VAR_public_key=key
+         export TF_VAR_runner_ip=51.75.162.65/32
+         terraform destroy -auto-approve -input=false
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
+    - name: Install Ansible
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      run: |
+        pip install ansible
+
+    - name: Extract EC2 Public IP
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      id: extract_ip
+      run: |
+        terraform init
+        IP=$(terraform output xc-public-ip | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
+        echo "::set-output name=ip::$IP"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
+    - name: Run Ansible Playbook
+      if: "${{ github.event.inputs.terraform_operation == 'apply' }}"
+      run: |
+         ansible-playbook -i "${{ env.ANSIBLE_HOST }}," \
+         -u ubuntu \
+         -e "ANSIBLE_HOST_KEY_CHECKING=False" \
+         -e "ansible_ssh_private_key_file=${{ secrets.SSH_PRIVATE_KEY_PATH }}" \
+         install_docker.yml
+      env:
+        SSH_PRIVATE_KEY_PATH: ${{ secrets.SSH_PRIVATE_KEY_PATH }}
+        ANSIBLE_HOST: ${{ steps.extract_ip.outputs.ip }}
